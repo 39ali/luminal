@@ -546,11 +546,11 @@ impl CudaRuntime {
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
         let bytes = self.get_output_data(id);
-        let bytes = bytes.leak();
-        let n_bytes = bytes.len();
-        let bytes_ptr = bytes.as_mut_ptr();
-        let float_ptr = bytes_ptr as *mut f32;
-        unsafe { Vec::from_raw_parts(float_ptr, n_bytes / 4, n_bytes / 4) }
+        let n = bytes.len() / 4;
+        let cap = bytes.capacity() / 4;
+        let ptr = bytes.as_ptr() as *mut f32;
+        std::mem::forget(bytes);
+        unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
     /// Take a GPU buffer handle for an output tensor. This removes the buffer from
@@ -648,20 +648,20 @@ impl CudaRuntime {
 
     pub fn get_f16(&self, id: impl ToId) -> Vec<f16> {
         let bytes = self.get_output_data(id);
-        let bytes = bytes.leak();
-        let n_bytes = bytes.len();
-        let bytes_ptr = bytes.as_mut_ptr();
-        let f16_ptr = bytes_ptr as *mut f16;
-        unsafe { Vec::from_raw_parts(f16_ptr, n_bytes / 2, n_bytes / 2) }
+        let n = bytes.len() / 2;
+        let cap = bytes.capacity() / 2;
+        let ptr = bytes.as_ptr() as *mut f16;
+        std::mem::forget(bytes);
+        unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
     pub fn get_bf16(&self, id: impl ToId) -> Vec<bf16> {
         let bytes = self.get_output_data(id);
-        let bytes = bytes.leak();
-        let n_bytes = bytes.len();
-        let bytes_ptr = bytes.as_mut_ptr();
-        let bf16_ptr = bytes_ptr as *mut bf16;
-        unsafe { Vec::from_raw_parts(bf16_ptr, n_bytes / 2, n_bytes / 2) }
+        let n = bytes.len() / 2;
+        let cap = bytes.capacity() / 2;
+        let ptr = bytes.as_ptr() as *mut bf16;
+        std::mem::forget(bytes);
+        unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
     /// Swap the GPU buffer of an output tensor into the input slot for another tensor.
