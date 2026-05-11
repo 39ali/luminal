@@ -3,13 +3,17 @@ mod model;
 
 use hf::prepare_hf_model;
 use luminal::prelude::*;
-use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
 use rustc_hash::FxHashSet;
 use std::{io::Write, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[cfg(target_os = "macos")]
+use luminal_metal::MetalRuntime as Backend;
+#[cfg(not(target_os = "macos"))]
+use luminal_cuda_lite::runtime::CudaRuntime as Backend;
 
 const REPO_ID: &str = "unsloth/gemma-3-4b-it";
 
@@ -23,9 +27,6 @@ fn main() {
         .with(tracing_subscriber::fmt::layer())
         .with(luminal_filter())
         .init();
-
-    let ctx = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
 
     let model_dir = prepare_hf_model(REPO_ID).expect("Failed to prepare model");
     println!("Using model directory: {}", model_dir.display());
@@ -46,10 +47,17 @@ fn main() {
     }
 
     println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<Backend>();
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream);
+    #[cfg(target_os = "macos")]
+    let mut runtime = Backend::initialize(());
+    #[cfg(not(target_os = "macos"))]
+    let mut runtime = {
+        let ctx = luminal_cuda_lite::cudarc::driver::CudaContext::new(0).unwrap();
+        Backend::initialize(ctx.default_stream())
+    };
+
     let weights_path = model_dir.join("model_combined.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 

@@ -5,7 +5,7 @@ use half::f16;
 use itertools::Itertools;
 use luminal::{
     dtype::DType,
-    graph::LLIRGraph,
+    graph::{Graph, LLIRGraph},
     hlir::{Input, NativeData, Output},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
@@ -13,15 +13,15 @@ use luminal::{
         FxHashMap, NodeIndex, ToId,
     },
 };
+use memmap2::MmapOptions;
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions};
 use objc::runtime::Object;
-use std::time::Duration;
+use safetensors::SafeTensors;
+use std::{fs::File, time::Duration};
 
 pub struct MetalRuntime {
     device: Device,
     command_queue: CommandQueue,
-    /// Host-side input tensors provided by the user.
-    input_data: FxHashMap<NodeIndex, NativeData>,
     /// Buffers for HLIR input tensors (set by user)
     pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
     /// Buffers for LLIR intermediate/output tensors
@@ -133,7 +133,25 @@ impl MetalRuntime {
     }
 
     pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
-        self.input_data.insert(id.to_id(), data.into());
+        let id = id.to_id();
+        let data: NativeData = data.into();
+        let dtype = self
+            .llir_graph
+            .node_indices()
+            .find_map(|n| {
+                if let Some(inp) = self.llir_graph[n].to_op::<Input>() {
+                    if inp.node == id.index() { Some(inp.dtype) } else { None }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| match &data {
+                NativeData::F32(_) => DType::F32,
+                NativeData::F16(_) | NativeData::Bf16(_) => DType::F16,
+                NativeData::Int(_) | NativeData::Bool(_) => DType::Int,
+            });
+        let buffer = self.create_input_buffer(&data, dtype);
+        self.hlir_buffers.insert(id, buffer);
     }
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
@@ -224,7 +242,6 @@ impl Runtime for MetalRuntime {
         Self {
             device,
             command_queue,
-            input_data: FxHashMap::default(),
             hlir_buffers: FxHashMap::default(),
             buffers: FxHashMap::default(),
             dyn_buffer,
@@ -242,7 +259,6 @@ impl Runtime for MetalRuntime {
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
         self.pipelines.clear();
         self.buffers.clear();
-        self.hlir_buffers.clear();
         self.node_dtypes.clear();
         self.llir_graph = Self::fuse_matmuls(llir_graph);
 
@@ -250,11 +266,6 @@ impl Runtime for MetalRuntime {
         for node in topo_order {
             if let Some(input) = self.llir_graph[node].to_op::<Input>() {
                 self.node_dtypes.insert(node, input.dtype);
-                let hlir_id = NodeIndex::new(input.node);
-                if let Some(data) = self.input_data.get(&hlir_id) {
-                    let buffer = self.create_input_buffer(data, input.dtype);
-                    self.hlir_buffers.insert(hlir_id, buffer);
-                }
                 continue;
             }
 
@@ -313,6 +324,8 @@ impl Runtime for MetalRuntime {
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+        self.allocate_intermediate_buffers(dyn_map);
+
         let llir_to_hlir: FxHashMap<NodeIndex, NodeIndex> = self
             .llir_graph
             .node_indices()
@@ -448,13 +461,95 @@ impl MetalRuntime {
             if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
                 let size = kernel_op.output_size().exec(dyn_map).unwrap();
                 let dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-                let buffer = self.device.new_buffer(
-                    (size * dtype.bits().div_ceil(8)) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                );
-                self.buffers.insert(node, buffer);
+                let needed = (size * dtype.bits().div_ceil(8)) as u64;
+                if self
+                    .buffers
+                    .get(&node)
+                    .map(|b| b.length() < needed)
+                    .unwrap_or(true)
+                {
+                    let buffer = self
+                        .device
+                        .new_buffer(needed, MTLResourceOptions::StorageModeShared);
+                    self.buffers.insert(node, buffer);
+                }
             }
         }
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
+        let f = File::open(file_path).expect("Failed to open safetensors file");
+        let mmap = unsafe { MmapOptions::new().map(&f).expect("Failed to mmap file") };
+        let st = SafeTensors::deserialize(&mmap).expect("Failed to parse safetensors");
+        for node in cx.graph.node_indices() {
+            if let Some(Input { label, node: hlir_node, .. }) =
+                (*cx.graph[node]).as_any().downcast_ref::<Input>()
+            {
+                if let Ok(tensor) = st.tensor(label) {
+                    let hlir_key = NodeIndex::new(*hlir_node);
+                    let bytes = tensor.data();
+                    match tensor.dtype() {
+                        safetensors::Dtype::F32
+                        | safetensors::Dtype::F16
+                        | safetensors::Dtype::BF16 => {
+                            let buffer = self.device.new_buffer_with_data(
+                                bytes.as_ptr() as *const _,
+                                bytes.len() as u64,
+                                MTLResourceOptions::StorageModeShared,
+                            );
+                            self.hlir_buffers.insert(hlir_key, buffer);
+                        }
+                        dtype => unimplemented!("{dtype:?} loading not supported yet"),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn set_zeros(&mut self, id: impl ToId, num_bytes: usize) {
+        let id: NodeIndex = id.to_id();
+        let buffer = self
+            .device
+            .new_buffer(num_bytes as u64, MTLResourceOptions::StorageModeShared);
+        unsafe { std::ptr::write_bytes(buffer.contents() as *mut u8, 0, num_bytes) };
+        self.hlir_buffers.insert(id, buffer);
+    }
+
+    pub fn remove_buffer(&mut self, id: impl ToId) -> Buffer {
+        let id = id.to_id();
+        let output_node = self
+            .llir_graph
+            .node_indices()
+            .find(|n| {
+                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
+                    *node == id.index()
+                } else {
+                    false
+                }
+            })
+            .expect("Cannot find output tensor for remove_buffer");
+
+        let data_node = self
+            .llir_graph
+            .neighbors_directed(output_node, Direction::Incoming)
+            .next()
+            .expect("Output node has no predecessor");
+
+        if let Some(Input { node, .. }) = self.llir_graph[data_node].to_op::<Input>() {
+            let hlir_node = NodeIndex::new(*node);
+            self.hlir_buffers
+                .remove(&hlir_node)
+                .expect("Cannot find HLIR buffer for remove_buffer")
+        } else {
+            self.buffers
+                .remove(&data_node)
+                .expect("Cannot find intermediate buffer for remove_buffer")
+        }
+    }
+
+    pub fn set_buffer(&mut self, id: impl ToId, buf: Buffer) {
+        self.hlir_buffers.insert(id.to_id(), buf);
     }
 
     fn update_dyn_buffer(&mut self, dyn_map: &FxHashMap<char, usize>) {

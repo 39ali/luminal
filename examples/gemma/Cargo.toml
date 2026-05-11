@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 luminal = { path = "../.." }
 luminal_nn = { path = "../../crates/luminal_nn" }
-luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
 luminal_tracing = {path="../../crates/luminal_tracing"}
 tokenizers = "0.22.2"
 tracing = "0.1.43"
@@ -23,3 +22,9 @@ half = {version = "2.7.1", features = ["bytemuck"]}
 bytemuck = "1.24.0"
 memmap2 = "0.9.9"
 rustc-hash = "2.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+luminal_metal = { path = "../../crates/luminal_metal" }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
