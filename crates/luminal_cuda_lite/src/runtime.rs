@@ -1430,35 +1430,6 @@ impl Runtime for CudaRuntime {
             }
         }
 
-        let bucket = &mut self.compiled_buckets[self.active_bucket];
-        Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, dyn_map);
-        // Cache HLIR input pointers
-        if !self.changed_hlir.is_empty() || !bucket.hlir_synced {
-            let hlir_nodes: Vec<NodeIndex> = if !bucket.hlir_synced {
-                // First time this bucket is active since HLIR changed — sync all
-                self.hlir_buffers.keys().copied().collect()
-            } else {
-                self.changed_hlir.iter().copied().collect()
-            };
-            for hlir_node in hlir_nodes {
-                let Some(&llir_node) = bucket.hlir_to_llir.get(&hlir_node) else {
-                    continue;
-                };
-                let Some(input) = self.hlir_buffers.get(&hlir_node) else {
-                    continue;
-                };
-                let ptr = match input {
-                    CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
-                    CudaInput::Ptr(p) => *p,
-                };
-                bucket.cached_buffer_ptrs.insert(llir_node, ptr);
-            }
-            bucket.hlir_synced = true;
-            // Only clear changed_hlir if single bucket (multi-bucket: others may need it)
-            if self.compiled_buckets.len() == 1 {
-                self.changed_hlir.clear();
-            }
-        }
         // Ensure all CUDA graphs are built (handles first execute and any missing graphs)
         self.prebuild_graphs(dyn_map);
 
