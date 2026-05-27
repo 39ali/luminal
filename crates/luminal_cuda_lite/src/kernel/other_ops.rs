@@ -1039,7 +1039,6 @@ impl KernelOp for KernelBatchMatMul {
             .chain(self.b_k_stride.dyn_vars())
             .collect();
 
-        let n_outputs: Expression = self.out_shape.iter().copied().product();
         let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
@@ -1047,9 +1046,33 @@ impl KernelOp for KernelBatchMatMul {
             ", const int* dyn_dims"
         };
 
-        let a_idx = flatten_strides(&self.out_shape, &self.a_stride).to_kernel();
-        let b_idx = flatten_strides(&self.out_shape, &self.b_stride).to_kernel();
-        let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
+        // Decompose out_shape into batch dims + [M, N]
+        let r = self.out_shape.len();
+        let m_dim = self.out_shape[r - 2];
+        let n_dim = self.out_shape[r - 1];
+        let batch_dims = &self.out_shape[..r - 2];
+        let batch_count: Expression = if batch_dims.is_empty() {
+            1.into()
+        } else {
+            batch_dims.iter().copied().product()
+        };
+
+        // a_stride = [...batch_strides, a_m_stride, 0(N-broadcast)]
+        // b_stride = [...batch_strides, 0(M-broadcast), b_n_stride]
+        let a_m_stride = self.a_stride[r - 2];
+        let b_n_stride = self.b_stride[r - 1];
+        let out_m_stride = self.out_stride[r - 2];
+
+        // Batch-only base addresses: const_z = blockIdx.x is the flat batch index
+        let a_batch_base_expr =
+            flatten_strides(batch_dims, &self.a_stride[..r - 2]).to_kernel();
+        let b_batch_base_expr =
+            flatten_strides(batch_dims, &self.b_stride[..r - 2]).to_kernel();
+        let out_batch_base_expr =
+            flatten_strides(batch_dims, &self.out_stride[..r - 2]).to_kernel();
+
+        let m_expr = m_dim.to_kernel();
+        let n_expr = n_dim.to_kernel();
         let k_expr = self.k_dim.to_kernel();
         let a_k_stride_expr = self
             .a_k_stride
@@ -1061,53 +1084,123 @@ impl KernelOp for KernelBatchMatMul {
             .substitute('z', Expression::from(1))
             .simplify()
             .to_kernel();
+        let a_m_stride_expr = a_m_stride
+            .substitute('z', Expression::from(1))
+            .simplify()
+            .to_kernel();
+        let b_n_stride_expr = b_n_stride
+            .substitute('z', Expression::from(1))
+            .simplify()
+            .to_kernel();
+        let out_m_stride_expr = out_m_stride
+            .substitute('z', Expression::from(1))
+            .simplify()
+            .to_kernel();
+
+        // Grid: (batch, ceil(M/32), ceil(N/32))
+        // Each block computes a 32×32 output tile via four 16×16 WMMA sub-tiles,
+        // one per warp: warp (tr, tc) owns output rows [tr*16..+16], cols [tc*16..+16].
+        let m_tiles = (m_dim + Expression::from(31)) / Expression::from(32);
+        let n_tiles = (n_dim + Expression::from(31)) / Expression::from(32);
 
         let kernel = format!(
             "
-#define WARP_SIZE 32
-#define THREADS_PER_BLOCK 256
-#define FULL_MASK 0xffffffff
+#include <mma.h>
+using namespace nvcuda;
+
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+#define TILE_M 32
+#define TILE_N 32
+#define BLOCK_THREADS 128
 {dyn_defines}
 extern \"C\" {{
-    __global__ void batch_matmul(float *out, const float *A, const float *B{dyn_dims_param}) {{
-        __shared__ float warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
-        long long const_z = blockIdx.x;
-        int tid = threadIdx.x;
-        int lane_id = tid % WARP_SIZE;
-        int warp_id = tid / WARP_SIZE;
+    __global__ void batch_matmul_tc(float *out, const float *A, const float *B{dyn_dims_param}) {{
+        // blockIdx.x = flat batch, blockIdx.y = 32-row tile, blockIdx.z = 32-col tile
+        long long const_z   = blockIdx.x;
+        long long m_tile    = blockIdx.y;
+        long long n_tile    = blockIdx.z;
+        int tid     = threadIdx.x;
+        int warp_id = tid / 32;
+        int tr = warp_id / 2;  // sub-tile row: 0 or 1
+        int tc = warp_id % 2;  // sub-tile col: 0 or 1
 
-        long long a_base = {a_idx};
-        long long b_base = {b_idx};
-        long long K = {k_expr};
-        long long a_k_stride = {a_k_stride_expr};
-        long long b_k_stride = {b_k_stride_expr};
+        long long M            = {m_expr};
+        long long N            = {n_expr};
+        long long K            = {k_expr};
+        long long a_k_stride   = {a_k_stride_expr};
+        long long b_k_stride   = {b_k_stride_expr};
+        long long a_m_stride   = {a_m_stride_expr};
+        long long b_n_stride   = {b_n_stride_expr};
+        long long a_batch_base = {a_batch_base_expr};
+        long long b_batch_base = {b_batch_base_expr};
+        long long out_base     = {out_batch_base_expr};
+        long long out_m_stride = {out_m_stride_expr};
 
-        float partial = 0.0f;
-        for (long long k = tid; k < K; k += THREADS_PER_BLOCK) {{
-            partial += A[a_base + k * a_k_stride] * B[b_base + k * b_k_stride];
-        }}
+        // A_smem[TILE_M][WMMA_K]: 32 rows × 16 cols of fp16
+        // B_smem[WMMA_K][TILE_N]: 16 rows × 32 cols of fp16
+        __shared__ __half A_smem[TILE_M * WMMA_K];
+        __shared__ __half B_smem[WMMA_K * TILE_N];
+        __shared__ float  out_smem[TILE_M * TILE_N];
 
-        #pragma unroll
-        for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
-            partial += __shfl_down_sync(FULL_MASK, partial, s);
-        }}
+        // Each warp owns one 16×16 accumulator sub-tile
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
 
-        if (lane_id == 0) {{
-            warp_sums[warp_id] = partial;
-        }}
-        __syncthreads();
-
-        if (warp_id == 0) {{
-            int cnt = THREADS_PER_BLOCK / WARP_SIZE;
-            float block_sum = tid < cnt ? warp_sums[tid] : 0.0f;
-
-            #pragma unroll
-            for (int s = cnt / 2; s > 0; s /= 2) {{
-                block_sum += __shfl_down_sync(FULL_MASK, block_sum, s);
+        for (long long k0 = 0; k0 < K; k0 += WMMA_K) {{
+            // All 128 threads cooperatively load A tile [m_tile*32..+32][k0..+16]
+            for (int i = tid; i < TILE_M * WMMA_K; i += BLOCK_THREADS) {{
+                int row = i / WMMA_K, col = i % WMMA_K;
+                long long m = m_tile * TILE_M + row;
+                long long k = k0 + col;
+                A_smem[i] = __float2half((m < M && k < K)
+                    ? A[a_batch_base + m * a_m_stride + k * a_k_stride]
+                    : 0.0f);
             }}
+            // All 128 threads cooperatively load B tile [k0..+16][n_tile*32..+32]
+            for (int i = tid; i < WMMA_K * TILE_N; i += BLOCK_THREADS) {{
+                int row = i / TILE_N, col = i % TILE_N;
+                long long k = k0 + row;
+                long long n = n_tile * TILE_N + col;
+                B_smem[i] = __float2half((k < K && n < N)
+                    ? B[b_batch_base + k * b_k_stride + n * b_n_stride]
+                    : 0.0f);
+            }}
+            __syncthreads();
 
-            if (tid == 0) {{
-                out[{out_idx}] = block_sum;
+            // Each warp independently computes its 16×16 sub-tile
+            // tr selects A rows [tr*16..+16], tc selects B cols [tc*16..+16]
+            wmma::load_matrix_sync(a_frag, A_smem + tr * WMMA_M * WMMA_K, WMMA_K);
+            wmma::load_matrix_sync(b_frag, B_smem + tc * WMMA_N, TILE_N);
+            wmma::mma_sync(acc, a_frag, b_frag, acc);
+            __syncthreads();
+        }}
+
+        long long out_m_base = m_tile * TILE_M + tr * WMMA_M;
+        long long out_n_base = n_tile * TILE_N + tc * WMMA_N;
+        if (out_m_base + WMMA_M <= M && out_n_base + WMMA_N <= N) {{
+            // Full sub-tile: each warp stores its fragment directly
+            wmma::store_matrix_sync(
+                out + out_base + out_m_base * out_m_stride + out_n_base,
+                acc, (unsigned int)out_m_stride, wmma::mem_row_major
+            );
+        }} else {{
+            // Boundary: all warps stage into out_smem, then scatter valid elements
+            wmma::store_matrix_sync(
+                out_smem + tr * WMMA_M * TILE_N + tc * WMMA_N,
+                acc, TILE_N, wmma::mem_row_major
+            );
+            __syncthreads();
+            for (int i = tid; i < TILE_M * TILE_N; i += BLOCK_THREADS) {{
+                int row = i / TILE_N, col = i % TILE_N;
+                long long m = m_tile * TILE_M + row;
+                long long n = n_tile * TILE_N + col;
+                if (m < M && n < N) {{
+                    out[out_base + m * out_m_stride + n] = out_smem[i];
+                }}
             }}
         }}
     }}
@@ -1119,18 +1212,19 @@ extern \"C\" {{
         } else {
             let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
-            let func = module.load_function("batch_matmul").unwrap();
+            let func = module.load_function("batch_matmul_tc").unwrap();
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
             (module, func)
         };
 
+        // Shared mem: A_smem (1024B) + B_smem (1024B) + out_smem (4096B) = 6144B
         (
             func,
             module,
             kernel,
-            (n_outputs, 1.into(), 1.into()),
-            (256.into(), 1.into(), 1.into()),
-            32.into(),
+            (batch_count, m_tiles, n_tiles),
+            (128.into(), 1.into(), 1.into()),
+            6144.into(),
             FxHashMap::default(),
         )
     }
