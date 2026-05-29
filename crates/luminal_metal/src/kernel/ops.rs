@@ -76,13 +76,11 @@ pub(crate) fn compile_shader(
     let function = library
         .get_function(function_name, None)
         .expect("Failed to get function from library");
-    let pipeline = device
+    device
         .new_compute_pipeline_state_with_function(&function)
         .unwrap_or_else(|err| {
             panic!("Failed to create Metal compute pipeline state for {function_name}: {err:?}\n{source}")
-        });
-
-    pipeline
+        })
 }
 
 fn lower_dynamic_consts(mut code: String) -> String {

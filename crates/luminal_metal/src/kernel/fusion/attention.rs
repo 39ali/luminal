@@ -210,9 +210,9 @@ impl MetalFusedPostRopeAttention {
 
     fn decode_heads_per_group(&self) -> usize {
         let kv_group = self.n_heads / self.n_kv_heads;
-        if kv_group % 4 == 0 && self.max_context <= 512 && self.head_dim * 4 <= 256 {
+        if kv_group.is_multiple_of(4) && self.max_context <= 512 && self.head_dim * 4 <= 256 {
             4
-        } else if kv_group % 2 == 0 && self.head_dim * 2 <= 256 {
+        } else if kv_group.is_multiple_of(2) && self.head_dim * 2 <= 256 {
             2
         } else {
             1

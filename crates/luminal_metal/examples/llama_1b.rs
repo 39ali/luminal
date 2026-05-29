@@ -207,6 +207,7 @@ impl Llama {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         input: GraphTensor,
