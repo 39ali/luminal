@@ -64,7 +64,13 @@ fn webgpu_simple_add_runs() {
     let mut rt = WebGpuRuntime::initialize(());
     rt.set_data(a, &[1.0, 2.0, 3.0, 4.0]);
     rt.set_data(b, &[5.0, 6.0, 7.0, 8.0]);
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(
+        rt,
+        CompileOptions {
+            limit: 5,
+            ..CompileOptions::default()
+        },
+    );
     rt.execute(&cx.dyn_map);
 
     assert_close(&rt.get_f32(output), &[6.0, 8.0, 10.0, 12.0], 0.001);
@@ -82,7 +88,13 @@ fn webgpu_generic_matmul_runs() {
     let mut rt = WebGpuRuntime::initialize(());
     rt.set_data(a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     rt.set_data(b, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-    rt = cx.search(rt, CompileOptions::new(10));
+    rt = cx.search(
+        rt,
+        CompileOptions {
+            limit: 10,
+            ..CompileOptions::default()
+        },
+    );
     rt.execute(&cx.dyn_map);
 
     assert_close(&rt.get_f32(output), &[58.0, 64.0, 139.0, 154.0], 0.001);
@@ -106,7 +118,13 @@ fn webgpu_large_reduce_dispatch_chunks() {
     let mut rt = WebGpuRuntime::initialize(());
     let data = vec![1.0f32; ROWS * 2];
     rt.set_data(input, data);
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(
+        rt,
+        CompileOptions {
+            limit: 5,
+            ..CompileOptions::default()
+        },
+    );
     rt.execute(&cx.dyn_map);
 
     let result = rt.get_f32(output);
