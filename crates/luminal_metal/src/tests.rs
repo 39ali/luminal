@@ -353,7 +353,7 @@ fn metal_set_data_reuses_input_buffer_and_preserves_logical_len() {
 
     let mut rt = MetalRuntime::initialize(());
     rt.set_data(input, vec![0.0f32; 8]);
-    rt = cx.search(rt, CompileOptions::new(1));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
     let initial_capacity = rt.hlir_buffers.get(&input.id).unwrap().length();
 
     cx.set_dim('s', 2);
